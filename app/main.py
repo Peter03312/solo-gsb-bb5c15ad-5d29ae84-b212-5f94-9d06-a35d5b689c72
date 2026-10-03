@@ -26,8 +26,11 @@ from .schemas import (
     EventBatchAccepted,
     EventBatchIn,
     EventBatchItemAck,
+    EventConfirmIn,
     EventIn,
+    EventPreviewOut,
     EventVersionRef,
+    PreviewShiftImpact,
     ReasonMinutes,
     RecomputedShift,
     ResultOut,
@@ -49,13 +52,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
         "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
         "现场网关断网恢复后可经 POST /events/batch 整批补传同一设备的事件列表"
         "（全或无：逐项核对版本链，任一非法整批失败）；"
+        "上报下一版本前可经 POST /events/preview 只读预演对已结算班次的影响，"
+        "再凭确认凭据经 POST /events/confirm 原子提交（状态已变则拒绝并要求重新预演）；"
         "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
         "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
         "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步；"
@@ -239,6 +244,65 @@ def ingest_event_batch(
     return EventBatchAccepted(
         device_id=payload.device_id,
         items=items,
+        recomputed=_recomputed_out(recomputed),
+    )
+
+
+@app.post("/events/preview", response_model=EventPreviewOut, tags=["events"])
+def preview_event(payload: EventIn, db: Session = Depends(get_db)):
+    """上报前只读预演：预览下一版本对已结算班次的影响并返回确认凭据。
+
+    - 字段校验与版本链规则同单条上报：同版本同内容 → 幂等标示
+      （idempotent=true，无影响班次）；同版本异内容 409 VERSION_CONFLICT、
+      跳号 409 VERSION_GAP、未知设备 404、非法输入 422；
+    - 以旧版与候选版区间并集找出相关已结算班次，按当前全部来源最新版本及
+      生效裁定给出各班次现有分钟数、拟变分钟数与差额；结果不变的班次也列出；
+    - 预演不写入事件、修订或变更；confirm_token 供 POST /events/confirm 原样回传。
+    """
+    idempotent, impacts, token = services.preview_event(db, payload)
+    return EventPreviewOut(
+        device_id=payload.device_id,
+        source_id=payload.source_id,
+        version=payload.version,
+        idempotent=idempotent,
+        impacts=[
+            PreviewShiftImpact(
+                shift_id=shift.id,
+                shift_start=shift.start_ts,
+                shift_end=shift.end_ts,
+                current=ReasonMinutes(**current),
+                proposed=ReasonMinutes(**proposed),
+                delta=ReasonMinutes(
+                    maintenance=proposed["maintenance"] - current["maintenance"],
+                    failure=proposed["failure"] - current["failure"],
+                    pending=proposed["pending"] - current["pending"],
+                ),
+            )
+            for shift, current, proposed in impacts
+        ],
+        confirm_token=token,
+    )
+
+
+@app.post("/events/confirm", response_model=EventAccepted, tags=["events"])
+def confirm_event(
+    payload: EventConfirmIn, response: Response, db: Session = Depends(get_db)
+):
+    """凭预演签发的确认凭据原子提交事件版本。
+
+    - 重新核对候选内容、来源版本链及影响结果的班次/事件/裁定状态：
+      任何状态已变 → 409 PREVIEW_STALE（须重新预演，不写入任何数据）；
+    - 状态未变才原子提交事件，并沿用现有更正规则仅为分钟数变化的班次
+      生成修订与变更（回执与单条上报一致：新建 201 / 幂等 200）；
+    - 相同确认重试幂等（200）；凭据损坏或伪造 → 422 INVALID_CONFIRM_TOKEN。
+    """
+    ev, idempotent, recomputed = services.confirm_event(db, payload.confirm_token)
+    response.status_code = 200 if idempotent else 201
+    return EventAccepted(
+        device_id=ev.device_id,
+        source_id=ev.source_id,
+        version=ev.version,
+        idempotent=idempotent,
         recomputed=_recomputed_out(recomputed),
     )
 

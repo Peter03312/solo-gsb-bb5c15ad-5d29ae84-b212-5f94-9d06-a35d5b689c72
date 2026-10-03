@@ -128,6 +128,41 @@ class EventBatchAccepted(BaseModel):
     recomputed: list[RecomputedShift] = []
 
 
+# ---------------------------------------------------------------- 上报预演与确认
+
+
+class PreviewShiftImpact(BaseModel):
+    """预演中某个相关已结算班次的影响（结果不变的班次也列出，差额为 0）。"""
+
+    shift_id: int
+    shift_start: datetime
+    shift_end: datetime
+    current: ReasonMinutes  # 现有分钟数（按当前全部来源最新版本及生效裁定计算）
+    proposed: ReasonMinutes  # 拟变分钟数（假设候选版本替换其来源当前最新版本）
+    delta: ReasonMinutes  # 差额 = 拟变 − 现有
+
+
+class EventPreviewOut(BaseModel):
+    """事件上报预演回执：版本链判定、相关已结算班次的影响清单与确认凭据。
+
+    预演为只读操作，不写入事件、修订或变更；confirm_token 为不透明凭据，
+    随 POST /events/confirm 原样回传以原子提交候选事件。
+    """
+
+    device_id: str
+    source_id: str
+    version: int
+    idempotent: bool  # True 表示同来源同版本同内容已存在：确认将幂等返回，无影响班次
+    impacts: list[PreviewShiftImpact]
+    confirm_token: str
+
+
+class EventConfirmIn(BaseModel):
+    """确认提交：原样回传预演签发的确认凭据。"""
+
+    confirm_token: str = Field(min_length=1, max_length=4096)
+
+
 class ResultOut(BaseModel):
     shift_id: int
     device_id: str

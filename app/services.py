@@ -505,36 +505,43 @@ def ingest_event_batch(
     return acks, recomputed
 
 
-def _recompute_affected_shifts(
+def _shifts_overlapping(
     db: Session,
     device_id: str,
     intervals: list[tuple[datetime, datetime]],
-) -> list[tuple[Shift, ShiftResult]]:
-    """迟到更正：按事件时间（相关来源批前/批后版本区间的并集）找出受影响的
-    已结算班次，用全部来源的最新版本与当前生效裁定重算；结果有变化时追加
-    新修订并记录差额。每个班次在此至多重算一次（至多一个新修订）。
+    *,
+    lock: bool,
+) -> list[Shift]:
+    """与任一区间相交（半开区间，端点相接不算）的班次，按 id 升序。
+
+    lock=True 时逐行 FOR UPDATE（固定加锁顺序，降低并发更正相互死锁的概率）。
     """
     if not intervals:
         return []
-    shifts = (
-        db.execute(
-            select(Shift)
-            .where(
-                Shift.device_id == device_id,
-                or_(
-                    *[
-                        and_(Shift.start_ts < end, Shift.end_ts > start)
-                        for start, end in intervals
-                    ]
-                ),
-            )
-            .order_by(Shift.id)  # 固定加锁顺序，降低并发更正相互死锁的概率
-            .with_for_update()
+    stmt = (
+        select(Shift)
+        .where(
+            Shift.device_id == device_id,
+            or_(
+                *[
+                    and_(Shift.start_ts < end, Shift.end_ts > start)
+                    for start, end in intervals
+                ]
+            ),
         )
-        .scalars()
-        .all()
+        .order_by(Shift.id)
     )
+    if lock:
+        stmt = stmt.with_for_update()
+    return list(db.execute(stmt).scalars().all())
 
+
+def _recompute_shifts(
+    db: Session, shifts: list[Shift]
+) -> list[tuple[Shift, ShiftResult]]:
+    """用全部来源的最新版本与当前生效裁定重算给定班次；结果有变化时追加
+    新修订并记录差额。每个班次在此至多重算一次（至多一个新修订）。
+    """
     recomputed: list[tuple[Shift, ShiftResult]] = []
     for shift in shifts:
         latest = _latest_revision(db, shift.id)
@@ -551,6 +558,406 @@ def _recompute_affected_shifts(
         db.flush()
         recomputed.append((shift, rev))
     return recomputed
+
+
+def _recompute_affected_shifts(
+    db: Session,
+    device_id: str,
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[Shift, ShiftResult]]:
+    """迟到更正：按事件时间（相关来源批前/批后版本区间的并集）找出受影响的
+    已结算班次（行锁串行化）并重算；仅结果变化的班次追加新修订。
+    """
+    return _recompute_shifts(db, _shifts_overlapping(db, device_id, intervals, lock=True))
+
+
+# ---------------------------------------------------------------- 上报预演与确认
+
+#: 确认凭据 HMAC 用途前缀（与快照续页游标域隔离，两种凭据互不通用）
+_PREVIEW_TOKEN_PURPOSE = b"event-preview-v1"
+
+
+def _preview_token_mac(payload: bytes) -> bytes:
+    return hmac.new(
+        settings.cursor_secret.encode(),
+        _PREVIEW_TOKEN_PURPOSE + b"\x00" + payload,
+        hashlib.sha256,
+    ).digest()
+
+
+def _candidate_payload(
+    device_id: str,
+    source_id: str,
+    version: int,
+    start: datetime,
+    end: datetime,
+    reason: str,
+) -> dict:
+    """确认凭据内的候选事件内容（起止统一为 UTC ISO 字符串）。"""
+    return {
+        "device_id": device_id,
+        "source_id": source_id,
+        "version": version,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "reason": reason,
+    }
+
+
+def _encode_confirm_token(candidate: dict, fingerprint: str) -> str:
+    """把候选事件与预演状态指纹编码为不透明确认凭据（base64url(JSON) + HMAC-SHA256）。"""
+    body = {"candidate": candidate, "fingerprint": fingerprint}
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+    mac = _preview_token_mac(payload)
+    return (
+        base64.urlsafe_b64encode(payload).rstrip(b"=")
+        + b"."
+        + base64.urlsafe_b64encode(mac).rstrip(b"=")
+    ).decode()
+
+
+def _decode_confirm_token(token: str) -> dict:
+    """解码并验签确认凭据；任何伪造/篡改/损坏一律视为非法凭据。"""
+    invalid = ApiError(
+        422,
+        "INVALID_CONFIRM_TOKEN",
+        "confirm token is invalid, malformed or tampered with; "
+        "run POST /events/preview again to obtain a fresh token",
+    )
+    parts = token.split(".")
+    if len(parts) != 2:
+        raise invalid
+
+    def _b64(seg: str) -> bytes:
+        return seg.encode() + b"=" * (-len(seg) % 4)
+
+    try:
+        payload = base64.urlsafe_b64decode(_b64(parts[0]))
+        mac = base64.urlsafe_b64decode(_b64(parts[1]))
+        body = json.loads(payload)
+    except (ValueError, json.JSONDecodeError):
+        raise invalid
+    if not hmac.compare_digest(mac, _preview_token_mac(payload)):
+        raise invalid
+    try:
+        cand = body["candidate"]
+        fingerprint = body["fingerprint"]
+        device_id = cand["device_id"]
+        source_id = cand["source_id"]
+        version = cand["version"]
+        reason = cand["reason"]
+        start = datetime.fromisoformat(cand["start"])
+        end = datetime.fromisoformat(cand["end"])
+    except (KeyError, TypeError, ValueError):
+        raise invalid
+    if (
+        not isinstance(device_id, str)
+        or not device_id
+        or not isinstance(source_id, str)
+        or not source_id
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+        or version < 1
+        or reason not in attribution.REASONS
+        or not isinstance(fingerprint, str)
+        or start.tzinfo is None
+        or end.tzinfo is None
+        or not start < end
+    ):
+        raise invalid
+    return {
+        "candidate": {
+            "device_id": device_id,
+            "source_id": source_id,
+            "version": version,
+            "start": _utc(start),
+            "end": _utc(end),
+            "reason": reason,
+        },
+        "fingerprint": fingerprint,
+    }
+
+
+def _settled_with_latest(
+    db: Session, shifts: list[Shift]
+) -> list[tuple[Shift, ShiftResult]]:
+    """筛出已结算班次并附其最新修订（保持输入顺序）。"""
+    out: list[tuple[Shift, ShiftResult]] = []
+    for shift in shifts:
+        latest = _latest_revision(db, shift.id)
+        if latest is not None:
+            out.append((shift, latest))
+    return out
+
+
+def _preview_state_fingerprint(
+    db: Session,
+    device_id: str,
+    source_id: str,
+    settled: list[tuple[Shift, ShiftResult]],
+) -> str:
+    """预演状态指纹：来源版本链游标 + 各相关已结算班次的最新修订号、
+    当前全部来源最新版本中与班次窗口相交的事件、以及各班次的生效裁定。
+
+    确认时在班次行锁内按同一口径重算并比对：任何影响结果的状态变化
+    （版本链推进、相关班次新修订/新结算、窗口内事件版本变化、裁定提交或撤销）
+    都会改变指纹，确认即被拒绝并要求重新预演。
+    """
+    src = db.execute(
+        select(EventSource).where(
+            EventSource.device_id == device_id,
+            EventSource.source_id == source_id,
+        )
+    ).scalar_one_or_none()
+    shift_states = []
+    for shift, latest in settled:
+        events = _current_event_views(db, device_id, shift.start_ts, shift.end_ts)
+        rulings = db.execute(
+            select(ManualAdjudication.id, ManualAdjudication.content_hash)
+            .where(
+                ManualAdjudication.shift_id == shift.id,
+                ManualAdjudication.status == "active",
+            )
+            .order_by(ManualAdjudication.id)
+        ).all()
+        shift_states.append(
+            {
+                "id": shift.id,
+                "start": _utc(shift.start_ts).isoformat(),
+                "end": _utc(shift.end_ts).isoformat(),
+                "revision": latest.revision,
+                "events": sorted(
+                    [
+                        e.source_id,
+                        e.version,
+                        _utc(e.start).isoformat(),
+                        _utc(e.end).isoformat(),
+                        e.reason,
+                    ]
+                    for e in events
+                ),
+                "rulings": [[r.id, r.content_hash] for r in rulings],
+            }
+        )
+    doc = {
+        "source": {
+            "last_version": src.last_version if src is not None else 0,
+            "last_content_hash": src.last_content_hash if src is not None else None,
+        },
+        "shifts": shift_states,
+    }
+    raw = json.dumps(doc, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _compute_with_candidate(
+    db: Session, shift: Shift, candidate: EventView
+) -> tuple[dict, list[dict]]:
+    """假设候选版本已替换其来源的当前最新版本，计算班次归因
+    （其余来源最新版本与当前生效裁定不变）。
+    """
+    events = [
+        e
+        for e in _current_event_views(
+            db, shift.device_id, shift.start_ts, shift.end_ts
+        )
+        if e.source_id != candidate.source_id
+    ]
+    events.append(candidate)
+    rulings = _active_ruling_views(db, shift.id)
+    return attribution.attribute_with_rulings(
+        shift.start_ts, shift.end_ts, events, rulings
+    )
+
+
+def preview_event(
+    db: Session, payload: EventIn
+) -> tuple[bool, list[tuple[Shift, dict, dict]], str]:
+    """只读预演上报一个事件版本：校验 + 影响预览 + 签发确认凭据。
+
+    返回 (是否幂等命中, 影响列表 [(班次, 现有分钟, 拟变分钟)], 确认凭据)。
+    字段校验与版本链规则同单条上报；预演不写入事件、修订或变更。
+    """
+    get_device_or_404(db, payload.device_id)
+    start, end = _utc(payload.start), _utc(payload.end)
+    digest = _content_hash(start, end, payload.reason)
+    src = db.execute(
+        select(EventSource).where(
+            EventSource.device_id == payload.device_id,
+            EventSource.source_id == payload.source_id,
+        )
+    ).scalar_one_or_none()
+    last_version = src.last_version if src is not None else 0
+    candidate = _candidate_payload(
+        payload.device_id, payload.source_id, payload.version, start, end, payload.reason
+    )
+
+    if payload.version <= last_version:
+        existing = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == payload.device_id,
+                EventVersion.source_id == payload.source_id,
+                EventVersion.version == payload.version,
+            )
+        ).scalar_one()
+        if existing.content_hash == digest:
+            # 同来源同版本同内容：确认时同样幂等返回，无影响班次
+            fingerprint = _preview_state_fingerprint(
+                db, payload.device_id, payload.source_id, []
+            )
+            return True, [], _encode_confirm_token(candidate, fingerprint)
+        raise ApiError(
+            409,
+            "VERSION_CONFLICT",
+            f"version {payload.version} of source {payload.source_id!r} "
+            "already exists with different content",
+        )
+    if payload.version > last_version + 1:
+        raise ApiError(
+            409,
+            "VERSION_GAP",
+            f"source {payload.source_id!r} expects version "
+            f"{last_version + 1}, got {payload.version}",
+        )
+
+    # 候选即下一版本：以旧版与候选版区间并集找出相关已结算班次
+    intervals = [(start, end)]
+    if last_version > 0:
+        prev = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == payload.device_id,
+                EventVersion.source_id == payload.source_id,
+                EventVersion.version == last_version,
+            )
+        ).scalar_one()
+        intervals.append((prev.start_ts, prev.end_ts))
+    settled = _settled_with_latest(
+        db, _shifts_overlapping(db, payload.device_id, intervals, lock=False)
+    )
+    candidate_view = EventView(
+        source_id=payload.source_id,
+        version=payload.version,
+        reason=payload.reason,
+        start=start,
+        end=end,
+    )
+    impacts: list[tuple[Shift, dict, dict]] = []
+    for shift, _latest in settled:
+        current, _ = _compute(db, shift)
+        proposed, _ = _compute_with_candidate(db, shift, candidate_view)
+        impacts.append((shift, current, proposed))
+    fingerprint = _preview_state_fingerprint(
+        db, payload.device_id, payload.source_id, settled
+    )
+    return False, impacts, _encode_confirm_token(candidate, fingerprint)
+
+
+def confirm_event(
+    db: Session, token: str
+) -> tuple[EventVersion, bool, list[tuple[Shift, ShiftResult]]]:
+    """凭预演签发的确认凭据原子提交事件版本。
+
+    返回 (事件版本, 是否幂等命中, 因更正而重算的 [(班次, 新修订)])。
+    - 重新核对候选内容与来源版本链：同版本同内容 → 幂等返回（相同确认重试）；
+      同版本异内容 / 跳号沿用单条上报的错误约定；
+    - 候选仍为下一版本时，在班次行锁内重算状态指纹并与凭据比对：
+      任何影响结果的状态已变 → 409 PREVIEW_STALE，不写入任何数据；
+    - 状态未变才在同一事务提交事件，并沿用现有更正规则仅为分钟数
+      变化的班次生成修订与变更。
+    """
+    state = _decode_confirm_token(token)
+    cand = state["candidate"]
+    device_id, source_id, version = (
+        cand["device_id"],
+        cand["source_id"],
+        cand["version"],
+    )
+    start, end, reason = cand["start"], cand["end"], cand["reason"]
+    get_device_or_404(db, device_id)
+    digest = _content_hash(start, end, reason)
+
+    # 与单条上报共用同一版本链行锁，串行化并发确认/上报
+    db.execute(
+        pg_insert(EventSource)
+        .values(device_id=device_id, source_id=source_id, last_version=0)
+        .on_conflict_do_nothing()
+    )
+    src = db.execute(
+        select(EventSource)
+        .where(
+            EventSource.device_id == device_id,
+            EventSource.source_id == source_id,
+        )
+        .with_for_update()
+    ).scalar_one()
+
+    if version <= src.last_version:
+        existing = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == device_id,
+                EventVersion.source_id == source_id,
+                EventVersion.version == version,
+            )
+        ).scalar_one()
+        if existing.content_hash == digest:
+            db.commit()  # 相同确认的重复提交（或同内容已另行上报）：幂等返回
+            return existing, True, []
+        raise ApiError(
+            409,
+            "VERSION_CONFLICT",
+            f"version {version} of source {source_id!r} "
+            "already exists with different content",
+        )
+    if version > src.last_version + 1:
+        raise ApiError(
+            409,
+            "VERSION_GAP",
+            f"source {source_id!r} expects version "
+            f"{src.last_version + 1}, got {version}",
+        )
+
+    # 候选仍是下一版本：锁定相关班次，重核预演后的状态指纹（不通过则不写入任何数据）
+    prev = None
+    if src.last_version > 0:
+        prev = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == device_id,
+                EventVersion.source_id == source_id,
+                EventVersion.version == src.last_version,
+            )
+        ).scalar_one()
+    intervals = [(start, end)]
+    if prev is not None:
+        intervals.append((prev.start_ts, prev.end_ts))
+    shifts = _shifts_overlapping(db, device_id, intervals, lock=True)
+    settled = _settled_with_latest(db, shifts)
+    fingerprint = _preview_state_fingerprint(db, device_id, source_id, settled)
+    if not hmac.compare_digest(fingerprint, state["fingerprint"]):
+        raise ApiError(
+            409,
+            "PREVIEW_STALE",
+            "state affecting the preview has changed since it was issued "
+            "(version chain, shifts, events or adjudications); "
+            "run POST /events/preview again and confirm with the fresh token",
+        )
+
+    ev = EventVersion(
+        device_id=device_id,
+        source_id=source_id,
+        version=version,
+        start_ts=start,
+        end_ts=end,
+        reason=reason,
+        content_hash=digest,
+    )
+    db.add(ev)
+    src.last_version = version
+    src.last_content_hash = digest
+    db.flush()
+
+    recomputed = _recompute_shifts(db, shifts)
+    db.commit()
+    return ev, False, recomputed
 
 
 # ---------------------------------------------------------------- 现场人工裁定
