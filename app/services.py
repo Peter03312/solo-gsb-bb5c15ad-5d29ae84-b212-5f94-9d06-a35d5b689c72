@@ -505,6 +505,32 @@ def ingest_event_batch(
     return acks, recomputed
 
 
+def _shifts_overlapping(
+    db: Session,
+    device_id: str,
+    intervals: list[tuple[datetime, datetime]],
+    *,
+    for_update: bool = False,
+) -> list[Shift]:
+    """与任一区间相交（半开区间判定）的班次，按 id 升序（固定加锁顺序）。"""
+    stmt = (
+        select(Shift)
+        .where(
+            Shift.device_id == device_id,
+            or_(
+                *[
+                    and_(Shift.start_ts < end, Shift.end_ts > start)
+                    for start, end in intervals
+                ]
+            ),
+        )
+        .order_by(Shift.id)  # 固定加锁顺序，降低并发更正相互死锁的概率
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return list(db.execute(stmt).scalars().all())
+
+
 def _recompute_affected_shifts(
     db: Session,
     device_id: str,
@@ -516,24 +542,7 @@ def _recompute_affected_shifts(
     """
     if not intervals:
         return []
-    shifts = (
-        db.execute(
-            select(Shift)
-            .where(
-                Shift.device_id == device_id,
-                or_(
-                    *[
-                        and_(Shift.start_ts < end, Shift.end_ts > start)
-                        for start, end in intervals
-                    ]
-                ),
-            )
-            .order_by(Shift.id)  # 固定加锁顺序，降低并发更正相互死锁的概率
-            .with_for_update()
-        )
-        .scalars()
-        .all()
-    )
+    shifts = _shifts_overlapping(db, device_id, intervals, for_update=True)
 
     recomputed: list[tuple[Shift, ShiftResult]] = []
     for shift in shifts:
@@ -551,6 +560,390 @@ def _recompute_affected_shifts(
         db.flush()
         recomputed.append((shift, rev))
     return recomputed
+
+
+# ---------------------------------------------------------------- 事件预演与确认
+
+#: 确认凭据类型标识（与快照续页游标区分，混用一律视为非法凭据）
+_PREVIEW_TOKEN_TYPE = "event_preview"
+
+
+def _compute_with_candidate(
+    db: Session,
+    shift: Shift,
+    source_id: str,
+    version: int,
+    start: datetime,
+    end: datetime,
+    reason: str,
+) -> tuple[dict, list[dict]]:
+    """以候选版本替换其来源的当前最新版本，按全部来源最新版本与生效裁定计算。"""
+    events = [
+        ev
+        for ev in _current_event_views(
+            db, shift.device_id, shift.start_ts, shift.end_ts
+        )
+        if ev.source_id != source_id
+    ]
+    events.append(
+        EventView(
+            source_id=source_id, version=version, reason=reason, start=start, end=end
+        )
+    )
+    rulings = _active_ruling_views(db, shift.id)
+    return attribution.attribute_with_rulings(
+        shift.start_ts, shift.end_ts, events, rulings
+    )
+
+
+def _shift_state_fingerprint(db: Session, shift: Shift, latest: ShiftResult) -> str:
+    """影响班次结果的输入状态指纹。
+
+    覆盖：班次当前最新修订号、与班次窗口相交的各来源最新事件版本（事件版本行
+    落库后不可变，(来源, 版本) 即内容标识）、全部现场裁定（含已撤销；裁定行
+    不可变，仅状态可变）的状态。任一变化都会改变指纹，确认时据此判定状态已变。
+    """
+    events = _current_event_views(db, shift.device_id, shift.start_ts, shift.end_ts)
+    rulings = db.execute(
+        select(ManualAdjudication.id, ManualAdjudication.status)
+        .where(ManualAdjudication.shift_id == shift.id)
+        .order_by(ManualAdjudication.id)
+    ).all()
+    body = {
+        "rev": latest.revision,
+        "events": sorted(f"{e.source_id}:{e.version}" for e in events),
+        "rulings": [f"{rid}:{status}" for rid, status in rulings],
+    }
+    raw = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def encode_preview_token(
+    device_id: str,
+    source_id: str,
+    version: int,
+    start: datetime,
+    end: datetime,
+    reason: str,
+    src_last_version: int,
+    shifts: list[dict],
+) -> str:
+    """把预演状态编码为不透明确认凭据（base64url(JSON) + HMAC-SHA256 签名，
+    与快照续页游标同一密钥与格式）。
+
+    shifts 为按班次 id 升序的 [{"id", "rev", "fp"}]（相关已结算班次及其结果
+    输入状态指纹）；确认时逐项复核，任何状态已变即拒绝提交。
+    """
+    body = {
+        "type": _PREVIEW_TOKEN_TYPE,
+        "device_id": device_id,
+        "source_id": source_id,
+        "version": version,
+        "start": start.astimezone(timezone.utc).isoformat(),
+        "end": end.astimezone(timezone.utc).isoformat(),
+        "reason": reason,
+        "src_last_version": src_last_version,
+        "shifts": shifts,
+    }
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+    mac = _snapshot_cursor_mac(payload)  # 与快照游标共用的 HMAC-SHA256 签名
+    return (
+        base64.urlsafe_b64encode(payload).rstrip(b"=")
+        + b"."
+        + base64.urlsafe_b64encode(mac).rstrip(b"=")
+    ).decode()
+
+
+def decode_preview_token(token: str) -> dict:
+    """解码并验签确认凭据；伪造/篡改/损坏/类型不符一律视为非法凭据。"""
+    invalid = ApiError(
+        422,
+        "INVALID_CONFIRM_TOKEN",
+        "confirm token is invalid, malformed or tampered with; "
+        "obtain a fresh one from POST /events/preview",
+    )
+    parts = token.split(".")
+    if len(parts) != 2:
+        raise invalid
+
+    def _b64(seg: str) -> bytes:
+        return seg.encode() + b"=" * (-len(seg) % 4)
+
+    try:
+        payload = base64.urlsafe_b64decode(_b64(parts[0]))
+        mac = base64.urlsafe_b64decode(_b64(parts[1]))
+        body = json.loads(payload)
+    except (ValueError, json.JSONDecodeError):
+        raise invalid
+    if not isinstance(body, dict) or not hmac.compare_digest(
+        mac, _snapshot_cursor_mac(payload)
+    ):
+        raise invalid
+    try:
+        if body.get("type") != _PREVIEW_TOKEN_TYPE:
+            raise ValueError
+        start = datetime.fromisoformat(body["start"])
+        end = datetime.fromisoformat(body["end"])
+        version = int(body["version"])
+        src_last_version = int(body["src_last_version"])
+        device_id = str(body["device_id"])
+        source_id = str(body["source_id"])
+        reason = str(body["reason"])
+        shifts = [
+            {"id": int(s["id"]), "rev": int(s["rev"]), "fp": str(s["fp"])}
+            for s in body["shifts"]
+        ]
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise invalid
+    if (
+        start.tzinfo is None
+        or end.tzinfo is None
+        or not start < end
+        or version < 1
+        or src_last_version < 0
+        or reason not in attribution.REASONS
+    ):
+        raise invalid
+    return {
+        "device_id": device_id,
+        "source_id": source_id,
+        "version": version,
+        "start": start,
+        "end": end,
+        "reason": reason,
+        "src_last_version": src_last_version,
+        "shifts": shifts,
+    }
+
+
+def preview_event(db: Session, payload: EventIn) -> tuple[bool, list[dict], str]:
+    """只读预演：核对候选版本并计算其对已结算班次的影响，不写入任何数据。
+
+    校验与版本链规则同单条上报（幂等 / 同版本异内容 / 跳号 / 未知设备）。
+    返回 (是否幂等命中, 影响列表, 确认凭据)；影响按班次 id 升序，以旧版与
+    候选版区间并集确定相关已结算班次，分钟数不变的班次也列出（changed=False）。
+    """
+    get_device_or_404(db, payload.device_id)
+    start, end = _utc(payload.start), _utc(payload.end)
+    digest = _content_hash(start, end, payload.reason)
+
+    # 只读：不补建来源行、不加锁；状态竞争由确认时的逐项复核兜底
+    src = db.execute(
+        select(EventSource).where(
+            EventSource.device_id == payload.device_id,
+            EventSource.source_id == payload.source_id,
+        )
+    ).scalar_one_or_none()
+    last_version = src.last_version if src is not None else 0
+
+    if payload.version <= last_version:
+        existing = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == payload.device_id,
+                EventVersion.source_id == payload.source_id,
+                EventVersion.version == payload.version,
+            )
+        ).scalar_one()
+        if existing.content_hash == digest:
+            # 同来源同版本同内容：确认将按现有幂等语义返回，无任何影响
+            token = encode_preview_token(
+                payload.device_id,
+                payload.source_id,
+                payload.version,
+                start,
+                end,
+                payload.reason,
+                last_version,
+                [],
+            )
+            return True, [], token
+        raise ApiError(
+            409,
+            "VERSION_CONFLICT",
+            f"version {payload.version} of source {payload.source_id!r} "
+            "already exists with different content",
+        )
+    if payload.version > last_version + 1:
+        raise ApiError(
+            409,
+            "VERSION_GAP",
+            f"source {payload.source_id!r} expects version "
+            f"{last_version + 1}, got {payload.version}",
+        )
+
+    # 相关班次：旧版本区间 ∪ 候选版本区间 内的已结算班次
+    intervals = [(start, end)]
+    if last_version > 0:
+        prev = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == payload.device_id,
+                EventVersion.source_id == payload.source_id,
+                EventVersion.version == last_version,
+            )
+        ).scalar_one()
+        intervals.append((prev.start_ts, prev.end_ts))
+
+    impacts: list[dict] = []
+    token_shifts: list[dict] = []
+    for shift in _shifts_overlapping(db, payload.device_id, intervals):
+        latest = _latest_revision(db, shift.id)
+        if latest is None:
+            continue  # 未结算：结算时自然采用最新版本，不属于对已结算班次的影响
+        proposed, _used = _compute_with_candidate(
+            db, shift, payload.source_id, payload.version, start, end, payload.reason
+        )
+        current = {
+            "maintenance": latest.maintenance_minutes,
+            "failure": latest.failure_minutes,
+            "pending": latest.pending_minutes,
+        }
+        delta = {k: proposed[k] - current[k] for k in current}
+        impacts.append(
+            {
+                "shift_id": shift.id,
+                "revision": latest.revision,
+                "current": current,
+                "proposed": proposed,
+                "delta": delta,
+                "changed": any(delta.values()),
+            }
+        )
+        token_shifts.append(
+            {
+                "id": shift.id,
+                "rev": latest.revision,
+                "fp": _shift_state_fingerprint(db, shift, latest),
+            }
+        )
+
+    token = encode_preview_token(
+        payload.device_id,
+        payload.source_id,
+        payload.version,
+        start,
+        end,
+        payload.reason,
+        last_version,
+        token_shifts,
+    )
+    return False, impacts, token
+
+
+def _preview_stale() -> ApiError:
+    return ApiError(
+        409,
+        "PREVIEW_STALE",
+        "state has changed since the preview; nothing was written, "
+        "re-run POST /events/preview and confirm with the fresh token",
+    )
+
+
+def confirm_event(
+    db: Session, token: str
+) -> tuple[EventVersion, bool, list[tuple[Shift, ShiftResult]]]:
+    """凭预演确认凭据原子提交候选事件版本。
+
+    - 重新核对候选内容、来源版本链及影响结果的班次/事件/裁定状态，
+      任一已变 → 409 PREVIEW_STALE，不写入任何数据（不得部分写入）；
+    - 状态未变 → 同事务落库事件并沿用现有更正规则重算（仅分钟数变化的
+      班次产生修订与变更）；
+    - 相同确认重试遵循现有事件幂等语义：同版本同内容幂等返回，
+      同版本异内容 / 跳号沿用既有错误约定。
+    """
+    state = decode_preview_token(token)
+    device_id = state["device_id"]
+    get_device_or_404(db, device_id)
+    start, end = state["start"], state["end"]
+    digest = _content_hash(start, end, state["reason"])
+
+    # 与单条上报共用同一版本链行锁，串行化并发上报/确认
+    db.execute(
+        pg_insert(EventSource)
+        .values(device_id=device_id, source_id=state["source_id"], last_version=0)
+        .on_conflict_do_nothing()
+    )
+    src = db.execute(
+        select(EventSource)
+        .where(
+            EventSource.device_id == device_id,
+            EventSource.source_id == state["source_id"],
+        )
+        .with_for_update()
+    ).scalar_one()
+
+    version = state["version"]
+    if version <= src.last_version:
+        existing = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == device_id,
+                EventVersion.source_id == state["source_id"],
+                EventVersion.version == version,
+            )
+        ).scalar_one()
+        if existing.content_hash == digest:
+            db.commit()
+            return existing, True, []  # 相同确认重试（或同内容已上报）：幂等
+        raise ApiError(
+            409,
+            "VERSION_CONFLICT",
+            f"version {version} of source {state['source_id']!r} "
+            "already exists with different content",
+        )
+    if version > src.last_version + 1:
+        raise ApiError(
+            409,
+            "VERSION_GAP",
+            f"source {state['source_id']!r} expects version "
+            f"{src.last_version + 1}, got {version}",
+        )
+    if src.last_version != state["src_last_version"]:
+        raise _preview_stale()  # 来源版本链在预演后已推进
+
+    intervals = [(start, end)]
+    if src.last_version > 0:
+        prev = db.execute(
+            select(EventVersion).where(
+                EventVersion.device_id == device_id,
+                EventVersion.source_id == state["source_id"],
+                EventVersion.version == src.last_version,
+            )
+        ).scalar_one()
+        intervals.append((prev.start_ts, prev.end_ts))
+
+    # 复核相关已结算班次集合及各班次的结果输入状态（班次行锁内，与结算/
+    # 更正/裁定写入相互串行；全部核对通过前不写入任何数据）
+    shifts = _shifts_overlapping(db, device_id, intervals, for_update=True)
+    settled: list[tuple[Shift, ShiftResult]] = []
+    for shift in shifts:
+        latest = _latest_revision(db, shift.id)
+        if latest is not None:
+            settled.append((shift, latest))
+    expected = state["shifts"]
+    if len(settled) != len(expected):
+        raise _preview_stale()
+    for (shift, latest), exp in zip(settled, expected):
+        if shift.id != exp["id"] or latest.revision != exp["rev"]:
+            raise _preview_stale()
+        if _shift_state_fingerprint(db, shift, latest) != exp["fp"]:
+            raise _preview_stale()
+
+    # 状态未变：原子提交候选版本，沿用现有更正规则重算受影响班次
+    ev = EventVersion(
+        device_id=device_id,
+        source_id=state["source_id"],
+        version=version,
+        start_ts=start,
+        end_ts=end,
+        reason=state["reason"],
+        content_hash=digest,
+    )
+    db.add(ev)
+    src.last_version = version
+    src.last_content_hash = digest
+    db.flush()
+    recomputed = _recompute_affected_shifts(db, device_id, intervals)
+    db.commit()
+    return ev, False, recomputed
 
 
 # ---------------------------------------------------------------- 现场人工裁定

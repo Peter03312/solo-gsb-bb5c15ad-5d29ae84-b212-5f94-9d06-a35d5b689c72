@@ -2,7 +2,9 @@
 
 按**班次**对设备停机时间进行归因的 HTTP 服务：输入设备、班次（带时区、整分钟）与停机事件
 （来源编号 + 连续递增版本 + 起止 + 原因），输出各班次的**保养 / 故障 / 待判**分钟数及所依据
-的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询；现场网关断网恢复后可
+的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询；上报下一版本前可经
+**预演-确认**两步提交：先只读预演候选版本对已结算班次的影响（现有/拟变分钟数与差额），
+再凭确认凭据原子提交（预演后任何相关状态已变即拒绝并要求重新预演）；现场网关断网恢复后可
 **整批补传**同一设备的事件列表（全或无：逐项核对版本链，任一非法整批失败，成功时按最终状态
 一次性重算受影响班次）；已结算班次还可登记**现场人工裁定**（唯一单号、整分钟区间、原因/说明，
 可按单号撤销），裁定按生效顺序覆盖自动事件归因、撤销后回退；所有结果变化通过**全局递增游标**
@@ -60,6 +62,15 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   - 同来源 + 同版本 + 同内容 → 幂等返回（`200`，`idempotent=true`），不产生新数据；
   - 同版本异内容 → `409 VERSION_CONFLICT`；跳号 → `409 VERSION_GAP`；
   - 新版本即对旧版本的更正，当前生效事件 = 每个来源的最新版本。
+- **预演-确认（上报前影响预览）**：`POST /events/preview` 输入与单条上报相同的
+  候选事件（设备、来源、版本、整分钟起止、原因），按现有校验与版本链规则**只读预演**
+  （不写入事件、修订或变更）：以旧版与候选版区间并集找出相关已结算班次，按当前全部
+  来源最新版本及生效裁定计算各班次的**现有分钟数、拟变分钟数与差额**，结果不变的班次
+  也列出（`changed=false`）；回执含不透明确认凭据 `confirm_token`。
+  `POST /events/confirm` 凭该凭据提交：重新核对候选内容、来源版本链及影响结果的
+  班次/事件/裁定状态，**任一已变 → `409 PREVIEW_STALE`，不写入任何数据**，需重新预演；
+  状态未变才原子提交事件，并沿用现有更正规则仅为分钟数变化的班次生成修订与变更；
+  相同确认重试遵循现有事件幂等语义（`200`，`idempotent=true`）。
 - **断网补传（批量上报）**：`POST /events/batch` 一次提交同一设备的**非空**事件列表，
   各项字段与校验同单条上报（来源、版本、起止、原因）。
   - 按列表顺序核对每个来源的版本链：已存在的同版本同内容项为幂等重试；
@@ -104,6 +115,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts` | 创建班次（重叠 409 / 未知设备 404 / 非法区间 422） |
 | `GET` | `/shifts/{id}` | 班次详情 |
 | `POST` | `/events` | 上报事件版本（新建 201 / 幂等 200 / 冲突·跳号 409） |
+| `POST` | `/events/preview` | 上报前只读预演：候选版本对已结算班次的影响（现有/拟变分钟数与差额），返回确认凭据 |
+| `POST` | `/events/confirm` | 凭确认凭据原子提交候选版本（201 / 幂等 200 / 状态已变 409 需重新预演） |
 | `POST` | `/events/batch` | 断网补传：同一设备事件列表整批上报（全或无；逐项回执新建/幂等；全部幂等 200，否则 201） |
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
@@ -128,11 +141,13 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 409 | `SHIFT_OVERLAP` | 同设备班次区间重叠 |
 | 409 | `VERSION_CONFLICT` | 同来源同版本但内容不同 |
 | 409 | `VERSION_GAP` | 版本跳号（含首版本不为 1） |
+| 409 | `PREVIEW_STALE` | 预演后相关状态（候选内容、来源版本链、班次/事件/裁定）已变，确认被拒绝且未写入任何数据，需重新预演 |
 | 409 | `SHIFT_NOT_SETTLED` | 班次尚未结算，不能登记现场裁定 |
 | 409 | `RULING_CONFLICT` | 裁定单号已存在但内容不同（含复用已撤销单号） |
 | 404 | `RULING_NOT_FOUND` | 班次下未知裁定单号 |
 | 422 | `RULING_OUT_OF_RANGE` | 裁定区间越出班次窗口 |
 | 422 | `VALIDATION_ERROR` | 非法参数：区间无效、缺时区、未对齐整分钟、原因非法、游标/页大小越界等 |
+| 422 | `INVALID_CONFIRM_TOKEN` | 确认凭据损坏、伪造或类型不符（如误用快照续页游标）；需重新预演获取凭据 |
 | 422 | `INVALID_CURSOR` | 同步游标超过当前最大变更序号（客户端进度异常，需从较小游标重新同步）；快照续页游标损坏、伪造或与设备/窗口/快照序号不匹配 |
 | 422 | `INVALID_SNAPSHOT_SEQ` | 快照序号超过当前已提交的最大变更序号（可取 0 或当前最大序号） |
 
@@ -402,6 +417,95 @@ curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
 # 空列表或任一项缺时区/未对齐整分钟/原因非法 → 422 VALIDATION_ERROR
 ```
 
+## 事件预演与确认（上报前影响预览）
+
+运维人员上报某 `(设备, 来源)` 的下一版本前，可先用 `POST /events/preview` **只读预演**
+候选版本对已结算班次的影响，确认无误后再用 `POST /events/confirm` **原子提交**。
+预演请求体与单条上报完全相同（`device_id` / `source_id` / `version` / `start` / `end` /
+`reason`），校验与版本链规则也相同（幂等 / 同版本异内容 409 / 跳号 409 / 未知设备 404 /
+非法输入 422）；预演本身不写入事件、修订或变更，可反复调用。
+
+**1. 预演**（接主流程第 7 步：班次 1 已结算，当前修订 2 为 保养 60 / 故障 30；
+拟上报 `PLC-9` 的版本 3：故障延长到 12:30）
+
+```bash
+curl -X POST http://localhost:8000/events/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","source_id":"PLC-9","version":3,
+       "start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T12:30:00+08:00",
+       "reason":"failure"}'
+# 200
+```
+
+```json
+{
+  "device_id": "CNC-01", "source_id": "PLC-9", "version": 3,
+  "idempotent": false,
+  "confirm_token": "eyJ0eXBlIjoiZXZlbnRfcHJldmlldyI...（不透明，原样回传）",
+  "impacts": [{
+    "shift_id": 1, "revision": 2,
+    "current":  {"maintenance": 60, "failure": 30, "pending": 0},
+    "proposed": {"maintenance": 60, "failure": 90, "pending": 0},
+    "delta":    {"maintenance": 0,  "failure": 60, "pending": 0},
+    "changed": true
+  }]
+}
+```
+
+> 相关班次按**旧版 ∪ 候选版区间并集**确定；`current` 为当前最新修订的分钟数，
+> `proposed` 为应用候选版本后按全部来源最新版本及生效裁定算得的分钟数，
+> `delta = proposed − current`；分钟数不变的班次也会列出（`changed=false`，
+> 确认后不会产生修订）。同版本同内容的重复预演返回 `idempotent=true` 且
+> `impacts=[]`（确认将幂等返回）。预演是只读的：结果、修订与 `/changes` 均不受影响。
+
+**2. 确认提交**：原样回传 `confirm_token`
+
+```bash
+curl -X POST http://localhost:8000/events/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm_token":"eyJ0eXBlIjoiZXZlbnRfcHJldmlldyI..."}'
+# 201
+```
+
+```json
+{
+  "device_id": "CNC-01", "source_id": "PLC-9", "version": 3,
+  "idempotent": false,
+  "recomputed": [{
+    "shift_id": 1, "revision": 3,
+    "totals": {"maintenance": 60, "failure": 90, "pending": 0},
+    "delta":  {"maintenance": 0,  "failure": 60, "pending": 0}
+  }]
+}
+```
+
+> 确认时重新核对候选内容、来源版本链及影响结果的班次/事件/裁定状态，全部未变才
+> 原子提交（事件落库 + 仅为分钟数变化的班次生成修订与变更，与单条上报的更正规则一致）。
+
+**3. 相同确认重试** → 遵循现有事件幂等语义：`200`，`idempotent=true`，不产生新数据
+
+```bash
+curl -X POST http://localhost:8000/events/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm_token":"<同一凭据>"}'
+# 200 {"version":3,"idempotent":true,"recomputed":[]}
+```
+
+**4. 预演后状态已变** → `409 PREVIEW_STALE`，不写入任何数据，需重新预演
+
+```bash
+# 预演 v4 之后、确认之前，该班次新增了一条现场裁定（或任一相关事件/班次状态变化）
+curl -X POST http://localhost:8000/events/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm_token":"<变化前预演得到的凭据>"}'
+# 409 {"detail":{"code":"PREVIEW_STALE","message":"state has changed since the preview; ..."}}
+# 处理：重新 POST /events/preview 获取新凭据后再确认
+```
+
+**5. 凭据非法**（损坏/伪造/误用快照续页游标）→ `422 INVALID_CONFIRM_TOKEN`；
+同版本异内容、跳号与非法输入沿用既有约定（`409 VERSION_CONFLICT` / `409 VERSION_GAP` /
+`422 VALIDATION_ERROR` / `404 DEVICE_NOT_FOUND`）。
+
 ## 变更同步（下游报表订阅）
 
 `GET /changes` 把每次**结算**与每次**导致结果变化的更正 / 现场裁定 / 撤销**暴露为按全局
@@ -578,6 +682,14 @@ curl 'http://localhost:8000/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:
   生效顺序；并发不丢失更新。
 - **迟到更正**：新版本落库后，按"旧版本区间 ∪ 新版本区间"找出受影响的已结算班次，用全部
   来源的最新版本与当前生效裁定重算；仅当分钟数变化时追加新修订（避免空修订），差额 = 新 − 旧。
+- **预演-确认**：预演只读 —— 不补建来源行、不加锁、不写任何数据，按"旧版 ∪ 候选版"区间
+  并集找出相关已结算班次，以候选版本替换其来源的当前最新版本后按全部来源最新版本与生效
+  裁定计算拟变分钟数。确认凭据为 `base64url(JSON).HMAC-SHA256`（与快照游标同一密钥，载荷
+  含类型标识、候选内容、来源版本链位置及各相关班次的"最新修订号 + 相交最新事件版本 +
+  裁定状态"指纹）。确认在与单条上报相同的来源行锁与班次行锁内逐项复核：任一状态已变即
+  `409 PREVIEW_STALE` 整体拒绝（未写入任何数据）；全部一致才同事务落库事件并复用
+  `_recompute_affected_shifts` 重算，相同凭据重试走版本链幂等分支（`200`），并发确认
+  同一凭据天然串行化为一次新建 + 其余幂等。
 - **断网补传**：批量接口与单条共用同一套版本链校验与内容哈希；批次内涉及的来源行按
   `source_id` 固定顺序 `FOR UPDATE` 加锁（与单条上报、其他批次相互串行，版本链连续无缺口），
   全部项核对通过前不写入任何数据，随后同事务应用全部新版本并一次性重算 —— 受影响班次按
@@ -617,6 +729,7 @@ tests/
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
   test_event_batch.py    # 断网补传（整批核对/全或无/重算/并发）端到端测试（需 PostgreSQL）
+  test_event_preview.py  # 事件预演与确认（只读预演/凭据/状态复核/幂等重试/并发）端到端测试（需 PostgreSQL）
   test_shift_snapshots.py  # 班次快照（固定序号/相交过滤/稳定翻页/不可变/游标校验）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt

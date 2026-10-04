@@ -26,7 +26,9 @@ from .schemas import (
     EventBatchAccepted,
     EventBatchIn,
     EventBatchItemAck,
+    EventConfirmIn,
     EventIn,
+    EventPreviewOut,
     EventVersionRef,
     ReasonMinutes,
     RecomputedShift,
@@ -34,6 +36,7 @@ from .schemas import (
     RevisionRef,
     SettleResponse,
     ShiftCreate,
+    ShiftImpactPreview,
     ShiftOut,
     ShiftSnapshotEntry,
     ShiftSnapshotPage,
@@ -49,11 +52,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
         "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
+        "上报前可经 POST /events/preview 只读预演候选版本对已结算班次的影响，"
+        "再凭确认凭据经 POST /events/confirm 原子提交（状态已变则拒绝并要求重新预演）；"
         "现场网关断网恢复后可经 POST /events/batch 整批补传同一设备的事件列表"
         "（全或无：逐项核对版本链，任一非法整批失败）；"
         "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
@@ -239,6 +244,55 @@ def ingest_event_batch(
     return EventBatchAccepted(
         device_id=payload.device_id,
         items=items,
+        recomputed=_recomputed_out(recomputed),
+    )
+
+
+@app.post("/events/preview", response_model=EventPreviewOut, tags=["events"])
+def preview_event(payload: EventIn, db: Session = Depends(get_db)):
+    """上报前只读预演：预览候选事件版本对已结算班次的影响。
+
+    - 字段、校验与版本链规则同单条上报：同版本同内容幂等（idempotent=true，
+      无影响）、同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP、
+      未知设备 404、非法输入 422；
+    - 以旧版与候选版区间并集找出相关已结算班次，按当前全部来源最新版本及
+      生效裁定计算各班次的现有分钟数、拟变分钟数与差额；结果不变的班次也
+      列出（changed=false）；
+    - 只读：不写入事件、修订或变更；返回的 confirm_token 供
+      POST /events/confirm 原样回传以原子提交。
+    """
+    idempotent, impacts, token = services.preview_event(db, payload)
+    return EventPreviewOut(
+        device_id=payload.device_id,
+        source_id=payload.source_id,
+        version=payload.version,
+        idempotent=idempotent,
+        confirm_token=token,
+        impacts=[ShiftImpactPreview(**i) for i in impacts],
+    )
+
+
+@app.post("/events/confirm", response_model=EventAccepted, tags=["events"])
+def confirm_event(
+    payload: EventConfirmIn, response: Response, db: Session = Depends(get_db)
+):
+    """凭预演确认凭据原子提交候选事件版本。
+
+    - 重新核对候选内容、来源版本链及影响结果的班次/事件/裁定状态，
+      任一已变 → 409 PREVIEW_STALE，不写入任何数据，需重新预演；
+    - 状态未变 → 201，同事务落库事件并沿用现有更正规则，仅为分钟数
+      变化的班次生成修订与变更（recomputed 中返回）；
+    - 相同确认重试遵循现有事件幂等语义（200，idempotent=true）；
+      同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP；
+    - 凭据伪造/篡改/损坏 → 422 INVALID_CONFIRM_TOKEN。
+    """
+    ev, idempotent, recomputed = services.confirm_event(db, payload.confirm_token)
+    response.status_code = 200 if idempotent else 201
+    return EventAccepted(
+        device_id=ev.device_id,
+        source_id=ev.source_id,
+        version=ev.version,
+        idempotent=idempotent,
         recomputed=_recomputed_out(recomputed),
     )
 

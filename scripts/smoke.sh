@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→修订/变更查询→班次快照 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -93,6 +93,37 @@ req POST /events/batch '{"device_id":"CNC-01","events":[
 
 echo "-- 批次失败后版本链未推进：PLC-9 v3 仍可经单条正常上报 --"
 req POST /events '{"device_id":"CNC-01","source_id":"PLC-9","version":3,"start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"failure"}'
+
+echo "-- 事件预演：PLC-9 v4 故障缩短为 10:30-11:00，只读预览对已结算班次的影响并返回确认凭据 --"
+PREVIEW="$(curl -sS -X POST "$BASE/events/preview" -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","source_id":"PLC-9","version":4,"start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}')"
+echo "$PREVIEW"; echo
+TOKEN="$(echo "$PREVIEW" | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirm_token"])')"
+
+echo "-- 确认提交：凭确认凭据原子落库，预期 201 且 recomputed 与预演影响一致 --"
+req POST /events/confirm "{\"confirm_token\":\"$TOKEN\"}"
+
+echo "-- 相同确认重试：遵循事件幂等语义，预期 200 且 idempotent=true --"
+req POST /events/confirm "{\"confirm_token\":\"$TOKEN\"}"
+
+echo "-- 预演后状态已变：先预演 MES-1 v3（同内容，影响列出但 changed=false），再上报新事件使凭据过期 --"
+PREVIEW2="$(curl -sS -X POST "$BASE/events/preview" -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","source_id":"MES-1","version":3,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"}')"
+echo "$PREVIEW2"; echo
+TOKEN2="$(echo "$PREVIEW2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirm_token"])')"
+req POST /events '{"device_id":"CNC-01","source_id":"ENV-1","version":1,"start":"2026-10-01T13:00:00+08:00","end":"2026-10-01T14:00:00+08:00","reason":"pending"}'
+
+echo "-- 凭过期凭据确认：预期 409 PREVIEW_STALE，不写入任何数据 --"
+req POST /events/confirm "{\"confirm_token\":\"$TOKEN2\"}"
+
+echo "-- 重新预演后再确认：预期 201（同内容新版本，分钟数不变故 recomputed 为空）--"
+PREVIEW3="$(curl -sS -X POST "$BASE/events/preview" -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","source_id":"MES-1","version":3,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"}')"
+TOKEN3="$(echo "$PREVIEW3" | python3 -c 'import sys,json;print(json.load(sys.stdin)["confirm_token"])')"
+req POST /events/confirm "{\"confirm_token\":\"$TOKEN3\"}"
+
+echo "-- 非法确认凭据：预期 422 INVALID_CONFIRM_TOKEN --"
+req POST /events/confirm '{"confirm_token":"not-a-valid-token"}'
 
 echo "-- 越界区间 / 未结算校验：越界 422 RULING_OUT_OF_RANGE，未知单号撤销 404 --"
 req POST /shifts/1/adjudications '{"ruling_no":"RX","start":"2026-10-01T07:00:00+08:00","end":"2026-10-01T09:00:00+08:00","reason":"failure","note":"越界"}'
